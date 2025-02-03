@@ -50,12 +50,7 @@
    pip install -r requirements.txt
    ```
 
-   如果没有提供 `requirements.txt`，请手动安装依赖：
-
-   ```bash
-   pip install requests tqdm
-   ```
-
+   
 3. **安装 FFmpeg**
 
    请参考 [FFmpeg 官网](https://ffmpeg.org/) 下载并安装 FFmpeg。
