@@ -1,0 +1,7 @@
+{
+    "cookies": "SESSDATA=xxx; DedeUserID=xxx; bili_jct=xxx",
+    "save_path": "./bili_videos",
+    "ffmpeg_path": "ffmpeg",
+    "request_interval": 1.5,
+    "max_retries": 3
+  }

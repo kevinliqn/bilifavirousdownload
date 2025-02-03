@@ -50,7 +50,7 @@
    pip install -r requirements.txt
    ```
 
-   
+
 3. **安装 FFmpeg**
 
    请参考 [FFmpeg 官网](https://ffmpeg.org/) 下载并安装 FFmpeg。
@@ -68,6 +68,7 @@
   "max_retries": 3
 }
 ```
+也可以查看仓库里的config-example.txt文件，那里面有例子
 
 - **cookies**  
   必须填写有效的 Bilibili Cookie，其中需包含 `DedeUserID` 字段，用于验证用户身份和获取收藏夹信息。
