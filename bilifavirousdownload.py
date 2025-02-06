@@ -10,6 +10,25 @@ from typing import List, Dict, Optional, Tuple, Set
 from dataclasses import dataclass
 from http.cookies import SimpleCookie, CookieError
 from tqdm import tqdm
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def get_session_with_retries(timeout: int = 60, retries: int = 5) -> requests.Session:
+    """
+    创建一个带重试机制的 Session，设置默认超时时间
+    """
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=retries,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.request_timeout = timeout
+    return session
 
 # ===================== 配置类 =====================
 @dataclass
@@ -26,8 +45,6 @@ class Config:
     def __post_init__(self):
         self.save_path.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 初始化空历史记录文件（指定 UTF-8 编码）
         if not self.history_file.exists():
             with open(self.history_file, "w", encoding="utf-8") as f:
                 json.dump([], f, indent=2, ensure_ascii=False)
@@ -36,7 +53,7 @@ class Config:
 class BilibiliDownloader:
     def __init__(self, config: Config):
         self.config = config
-        self.session = requests.Session()
+        self.session = get_session_with_retries(timeout=60, retries=5)
         self._init_session()
         self.logger = self._setup_logger()
         self.downloaded = self._load_download_history()
@@ -63,19 +80,13 @@ class BilibiliDownloader:
 
     # ------------------- 下载记录管理 -------------------
     def _load_download_history(self) -> Set[Tuple[str, int, int]]:
-        """加载下载历史记录（自动处理空文件），使用 UTF-8 编码读取"""
         try:
             if self.config.history_file.exists():
-                # 检查空文件
                 if self.config.history_file.stat().st_size == 0:
                     return set()
-                
                 with open(self.config.history_file, "r", encoding="utf-8") as f:
                     records = json.load(f)
-                    return {
-                        (item["bvid"], item["cid"], item["quality"])
-                        for item in records
-                    }
+                    return {(item["bvid"], item["cid"], item["quality"]) for item in records}
             return set()
         except json.JSONDecodeError:
             self.logger.error("历史记录文件损坏，已重置")
@@ -84,22 +95,20 @@ class BilibiliDownloader:
             self.logger.error(f"加载历史记录失败: {str(e)}")
             return set()
 
-    def _save_download_entry(self, bvid: str, cid: int, quality: int, title: str):
-        """安全保存下载记录，同时记录视频名称，使用 UTF-8 编码写入"""
+    def _save_download_entry(self, bvid: str, cid: int, quality: int, title: str, up_name: str):
         try:
             records = []
             if self.config.history_file.exists():
                 with open(self.config.history_file, "r", encoding="utf-8") as f:
                     records = json.load(f)
-            
             records.append({
                 "bvid": bvid,
                 "cid": cid,
                 "quality": quality,
-                "title": title,  # 记录视频名称
+                "title": title,
+                "up": up_name,
                 "timestamp": int(time.time())
             })
-            
             with open(self.config.history_file, "w", encoding="utf-8") as f:
                 json.dump(records, f, indent=2, ensure_ascii=False)
         except Exception as e:
@@ -107,7 +116,6 @@ class BilibiliDownloader:
 
     # ------------------- 收藏夹获取 -------------------
     def get_user_folders(self) -> List[Dict]:
-        """安全获取收藏夹列表"""
         try:
             cookies = SimpleCookie()
             try:
@@ -115,53 +123,39 @@ class BilibiliDownloader:
             except CookieError as e:
                 self.logger.error(f"Cookie解析失败: {str(e)}")
                 return []
-
-            # 验证 DedeUserID
             dede_userid = cookies.get("DedeUserID")
             if not dede_userid or not dede_userid.value.isdigit():
                 self.logger.error("无效的用户身份凭证，请检查Cookie中的DedeUserID")
                 return []
-
-            # 获取收藏夹数据
             created = self._get_paginated_data(
                 "https://api.bilibili.com/x/v3/fav/folder/created/list",
                 {"up_mid": dede_userid.value},
-                "list"
+                data_key="list"
             )
             collected = self._get_paginated_data(
                 "https://api.bilibili.com/x/v3/fav/folder/collected/list",
                 data_key="list"
             )
-            
             return created + collected
         except Exception as e:
             self.logger.error(f"获取收藏夹失败: {str(e)}")
             return []
 
     def _get_paginated_data(self, url: str, params: dict = None, data_key: str = "medias") -> List[Dict]:
-        """通用分页请求方法"""
         results = []
         page = 1
         while True:
             try:
-                resp = self.session.get(
-                    url,
-                    params={"pn": page, "ps": 20, **(params or {})},
-                    timeout=10
-                )
+                resp = self.session.get(url, params={"pn": page, "ps": 20, **(params or {})}, timeout=60)
                 resp.raise_for_status()
                 data = resp.json()
-
                 if data["code"] != 0:
                     self.logger.error(f"API错误[{url}]: {data.get('message')}")
                     break
-
                 items = data["data"].get(data_key, [])
                 results.extend(items)
-
                 if len(items) < 20:
                     break
-
                 page += 1
                 time.sleep(self.config.request_interval)
             except Exception as e:
@@ -171,49 +165,42 @@ class BilibiliDownloader:
 
     # ------------------- 视频处理 -------------------
     def get_video_info(self, bvid: str) -> Optional[Dict]:
-        """获取视频元数据"""
         try:
-            resp = self.session.get(
-                f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
-                timeout=10
-            )
+            resp = self.session.get(f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}", timeout=60)
             resp.raise_for_status()
             data = resp.json()
-            
             if data["code"] != 0:
                 self.logger.error(f"视频信息获取失败: {data.get('message')}")
                 return None
-                
             return data["data"]
         except Exception as e:
             self.logger.error(f"请求异常: {str(e)}")
             return None
 
     def get_available_qualities(self, bvid: str, cid: int) -> Dict[int, str]:
-        """安全获取清晰度列表"""
+        """
+        获取视频可选清晰度列表，支持4K、HDR、8K等
+        """
         try:
             resp = self.session.get(
                 "https://api.bilibili.com/x/player/playurl",
                 params={
                     "bvid": bvid,
                     "cid": cid,
-                    "fnval": 16  # DASH格式
+                    "qn": 0,
+                    "fnval": 4048,
+                    "fourk": 1,
+                    "fnver": 0
                 },
-                timeout=10
+                timeout=60
             )
             resp.raise_for_status()
             data = resp.json()
-
             if data["code"] != 0:
                 self.logger.error(f"清晰度接口错误: {data.get('message')}")
                 return {}
-
-            # 安全解析描述
             qualities = {}
-            for qn, desc in zip(
-                data["data"]["accept_quality"],
-                data["data"]["accept_description"]
-            ):
+            for qn, desc in zip(data["data"]["accept_quality"], data["data"]["accept_description"]):
                 if ":" in desc:
                     _, desc_part = desc.split(":", 1)
                     qualities[qn] = desc_part.strip()
@@ -225,13 +212,11 @@ class BilibiliDownloader:
             return {}
 
     def _download_media(self, url: str, path: Path) -> bool:
-        """带重试的下载方法"""
         for retry in range(self.config.max_retries):
             try:
-                with self.session.get(url, stream=True, timeout=30) as r:
+                with self.session.get(url, stream=True, timeout=60) as r:
                     r.raise_for_status()
                     total_size = int(r.headers.get("content-length", 0))
-
                     with open(path, "wb") as f, tqdm(
                         desc=f"下载 {path.name}",
                         total=total_size,
@@ -252,7 +237,6 @@ class BilibiliDownloader:
         return False
 
     def _merge_files(self, video_path: Path, audio_path: Path, output_path: Path) -> bool:
-        """合并音视频文件"""
         try:
             subprocess.run(
                 [
@@ -276,61 +260,69 @@ class BilibiliDownloader:
             self.logger.error(f"FFmpeg异常: {str(e)}")
             return False
 
-    def download_video(self, bvid: str, cid: int, quality: int) -> bool:
-        """完整的下载流程"""
+    def download_video(self, bvid: str, cid: int, quality: int, dest_dir: Optional[Path] = None, suffix: str = "") -> bool:
+        """
+        完整的下载流程
+        参数:
+          bvid: 视频 bvid
+          cid: 分P对应的 cid
+          quality: 清晰度码
+          dest_dir: 视频保存目录，若为 None 则保存在配置中的 save_path 下
+          suffix: 输出文件名后缀（例如"-hdr"）
+        """
         try:
-            # 跳过已下载
             if (bvid, cid, quality) in self.downloaded:
                 self.logger.info(f"跳过已下载内容: {bvid}-{cid}")
                 return True
 
-            # 获取视频信息
             video_info = self.get_video_info(bvid)
             if not video_info:
                 return False
 
-            # 生成文件名及视频标题
             title = re.sub(r'[\\/:*?"<>|]', "", video_info["title"]).strip()[:100]
             page_info = next((p for p in video_info["pages"] if p["cid"] == cid), None)
             if not page_info:
                 self.logger.error(f"未找到分P信息: {bvid}-{cid}")
                 return False
-                
-            output_name = f"{title}_{re.sub(r'[\\/:*?"<>|]', '', page_info['part']).strip()}.mp4"
-            output_path = self.config.save_path / output_name
 
-            # 获取下载地址
+            owner = video_info.get("owner", {})
+            up_name = owner.get("name", "unknown")
+            up_name = re.sub(r'[\\/:*?"<>|]', "", up_name).strip()
+
+            output_name = f"{title}_{re.sub(r'[\\/:*?\"<>|]', '', page_info['part']).strip()}-{up_name}{suffix}.mp4"
+            if dest_dir is None:
+                dest_dir = self.config.save_path
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            output_path = dest_dir / output_name
+
             video_url, audio_url = self._get_media_urls(bvid, cid, quality)
             if not video_url or not audio_url:
                 return False
 
-            # 准备临时文件
             temp_video = self.config.temp_dir / f"{bvid}_{cid}_video.m4s"
             temp_audio = self.config.temp_dir / f"{bvid}_{cid}_audio.m4s"
 
-            # 执行下载
             success = (
                 self._download_media(video_url, temp_video) and
                 self._download_media(audio_url, temp_audio) and
                 self._merge_files(temp_video, temp_audio, output_path)
             )
 
-            # 更新记录（同时记录视频名称）
             if success:
-                self._save_download_entry(bvid, cid, quality, title)
+                self._save_download_entry(bvid, cid, quality, title, up_name)
                 self.downloaded.add((bvid, cid, quality))
-
-            # 清理临时文件
             temp_video.unlink(missing_ok=True)
             temp_audio.unlink(missing_ok=True)
             return success
-
         except Exception as e:
             self.logger.error(f"下载流程异常: {str(e)}")
             return False
 
     def _get_media_urls(self, bvid: str, cid: int, quality: int) -> Tuple[Optional[str], Optional[str]]:
-        """获取媒体文件地址"""
+        """
+        获取媒体文件地址，传入支持高画质参数，
+        并优先选取 hi-res（id==30251）的音频
+        """
         try:
             resp = self.session.get(
                 "https://api.bilibili.com/x/player/playurl",
@@ -338,23 +330,32 @@ class BilibiliDownloader:
                     "bvid": bvid,
                     "cid": cid,
                     "qn": quality,
-                    "fnval": 16
+                    "fnval": 4048,
+                    "fourk": 1,
+                    "fnver": 0
                 },
-                timeout=10
+                timeout=60
             )
             resp.raise_for_status()
             data = resp.json()
-
             if data["code"] != 0:
                 return None, None
-
-            dash = data["data"]["dash"]
-            video_stream = max(
-                (v for v in dash["video"] if v["id"] == quality),
-                key=lambda x: x["bandwidth"]
-            )
-            audio_stream = max(dash["audio"], key=lambda x: x["bandwidth"])
-            return video_stream["base_url"], audio_stream["base_url"]
+            dash = data["data"].get("dash")
+            if not dash:
+                return None, None
+            video_stream = max((v for v in dash["video"] if v["id"] == quality),
+                               key=lambda x: x["bandwidth"],
+                               default=None)
+            hi_res_audio = next((a for a in dash["audio"] if a.get("id") == 30251), None)
+            if hi_res_audio is not None:
+                audio_stream = hi_res_audio
+            else:
+                audio_stream = max(dash["audio"], key=lambda x: x["bandwidth"], default=None)
+            if video_stream and audio_stream:
+                video_url = video_stream.get("baseUrl") or video_stream.get("base_url")
+                audio_url = audio_stream.get("baseUrl") or audio_stream.get("base_url")
+                return video_url, audio_url
+            return None, None
         except Exception as e:
             self.logger.error(f"媒体地址获取失败: {str(e)}")
             return None, None
@@ -368,10 +369,9 @@ class InteractiveManager:
         sorted_qn = sorted(qualities.items(), key=lambda x: x[0], reverse=True)
         for idx, (qn, desc) in enumerate(sorted_qn, 1):
             print(f"  {idx}. {qn} - {desc}")
-
         default_qn = sorted_qn[0][0]
         while True:
-            choice = input(f"请输入清晰度（默认{default_qn}）: ").strip()
+            choice = input(f"请输入清晰度（默认 {default_qn}）: ").strip()
             if not choice:
                 return default_qn
             try:
@@ -384,16 +384,14 @@ class InteractiveManager:
 
     @staticmethod
     def select_folders(folders: List[Dict]) -> List[str]:
-        """选择收藏夹"""
+        """选择收藏夹，返回收藏夹的 id 列表"""
         print("\n发现收藏夹:")
         for idx, folder in enumerate(folders, 1):
             print(f"  {idx}. {folder['title']} ({folder['media_count']}个视频)")
-
         while True:
             selection = input("\n请选择要下载的序号（多个用逗号分隔，q退出）: ").strip()
             if selection.lower() == "q":
                 return []
-            
             try:
                 selected = [int(s.strip()) for s in selection.split(",")]
                 if all(1 <= num <= len(folders) for num in selected):
@@ -404,7 +402,6 @@ class InteractiveManager:
 
 # ===================== 主程序 =====================
 def main():
-    # 加载配置，指定 UTF-8 编码
     try:
         with open("config.json", encoding="utf-8") as f:
             config_data = json.load(f)
@@ -426,32 +423,36 @@ def main():
     downloader = BilibiliDownloader(config)
     print(f"已加载历史记录：{len(downloader.downloaded)} 条")
 
-    # 新增功能：询问是否以每个视频的最高画质下载
     use_highest_quality = False
     choice = input("是否以最高画质下载所有视频？(Y/n): ").strip().lower()
     if choice in ("", "y", "yes"):
         use_highest_quality = True
 
-    # 获取收藏夹
     folders = downloader.get_user_folders()
     if not folders:
-        print("错误：无法获取收藏夹，请检查：")
-        print("1. Cookie是否有效（包含DedeUserID）")
-        print("2. 网络连接是否正常")
+        print("错误：无法获取收藏夹，请检查Cookie或网络连接")
         return
 
-    # 用户选择收藏夹
     selected_ids = InteractiveManager.select_folders(folders)
     if not selected_ids:
         print("下载已取消")
         return
 
-    # 处理每个收藏夹
     for folder_id in selected_ids:
-        print(f"\n正在处理收藏夹 ID: {folder_id}")
+        folder_info = next((f for f in folders if f["id"] == folder_id), None)
+        if folder_info is None:
+            print(f"未找到收藏夹信息: {folder_id}")
+            continue
+
+        folder_title = re.sub(r'[\\/:*?"<>|]', "", folder_info["title"]).strip() or folder_id
+        folder_dir = config.save_path / folder_title
+        folder_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n正在处理收藏夹: {folder_title} (ID: {folder_id})")
+
         medias = downloader._get_paginated_data(
-            "https://api.bilibili.com/x/v3/fav/resource/list",
-            {"media_id": folder_id}
+            "https://api.bilibili.com/medialist/gateway/base/spaceDetail",
+            {"media_id": folder_id, "keyword": "", "order": "mtime", "type": 0, "tid": 0, "jsonp": "jsonp"},
+            data_key="medias"
         )
 
         for media in medias:
@@ -459,36 +460,47 @@ def main():
             if not bvid:
                 continue
 
-            # 获取视频信息
             video_info = downloader.get_video_info(bvid)
             if not video_info:
                 print(f"跳过无效视频: {bvid}")
                 continue
 
-            # 处理每个分P
             for page in video_info.get("pages", []):
                 cid = page.get("cid")
                 if not cid:
                     continue
 
-                # 获取清晰度
                 qualities = downloader.get_available_qualities(bvid, cid)
                 if not qualities:
                     print(f"视频可能受地区限制或需要登录: {video_info['title']}")
                     continue
 
-                # 根据用户选择自动确定清晰度
                 if use_highest_quality:
-                    # 自动选取所有可选清晰度中数值最大的（最高画质）
-                    selected_quality = max(qualities.keys())
+                    allowed = {16, 32, 64, 80, 112, 116, 120, 125, 127}
+                    avail = allowed.intersection(set(qualities.keys()))
+                    if avail:
+                        selected_quality = max(avail)
+                    else:
+                        selected_quality = max(qualities.keys())
                 else:
                     selected_quality = InteractiveManager.select_quality(qualities)
 
-                # 执行下载
-                if downloader.download_video(bvid, cid, selected_quality):
-                    print(f"✓ 成功: {video_info['title']} - {page['part']}")
+                # 下载最高画质版本（下载结果放在收藏夹目录下）
+                if downloader.download_video(bvid, cid, selected_quality, dest_dir=folder_dir):
+                    print(f"✓ 成功下载: {video_info['title']} - {page['part']}")
                 else:
-                    print(f"✗ 失败: {video_info['title']} - {page['part']}")
+                    print(f"✗ 下载失败: {video_info['title']} - {page['part']}")
+
+                # 检查是否支持HDR：根据描述中包含 "HDR" 或 "杜比视界"
+                hdr_candidates = [q for q, desc in qualities.items() if "HDR" in desc or "杜比视界" in desc]
+                if hdr_candidates:
+                    hdr_quality = max(hdr_candidates)
+                    hdr_dir = folder_dir / "hdr"
+                    hdr_dir.mkdir(parents=True, exist_ok=True)
+                    if downloader.download_video(bvid, cid, hdr_quality, dest_dir=hdr_dir, suffix="-hdr"):
+                        print(f"✓ HDR版本下载成功: {video_info['title']} - {page['part']}")
+                    else:
+                        print(f"✗ HDR版本下载失败: {video_info['title']} - {page['part']}")
 
 if __name__ == "__main__":
     main()
