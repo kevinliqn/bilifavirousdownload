@@ -31,6 +31,24 @@ def get_session_with_retries(timeout: int = 60, retries: int = 5) -> requests.Se
     return session
 
 # ===================== 配置类 =====================
+# @dataclass
+# class Config:
+#     """程序配置项"""
+#     cookies: str
+#     save_path: Path = Path("./downloads")
+#     ffmpeg_path: str = "ffmpeg"
+#     request_interval: float = 1.5
+#     max_retries: int = 3
+#     history_file: Path = Path("./download_history.json")
+#     temp_dir: Path = Path("./temp")
+
+#     def __post_init__(self):
+#         self.save_path.mkdir(parents=True, exist_ok=True)
+#         self.temp_dir.mkdir(parents=True, exist_ok=True)
+#         if not self.history_file.exists():
+#             with open(self.history_file, "w", encoding="utf-8") as f:
+#                 json.dump([], f, indent=2, ensure_ascii=False)
+
 @dataclass
 class Config:
     """程序配置项"""
@@ -41,6 +59,10 @@ class Config:
     max_retries: int = 3
     history_file: Path = Path("./download_history.json")
     temp_dir: Path = Path("./temp")
+    # 新增的三个配置项必须显式声明
+    max_title_length: int = 80
+    max_filename_length: int = 240
+    upname_max_length: int = 10
 
     def __post_init__(self):
         self.save_path.mkdir(parents=True, exist_ok=True)
@@ -48,6 +70,7 @@ class Config:
         if not self.history_file.exists():
             with open(self.history_file, "w", encoding="utf-8") as f:
                 json.dump([], f, indent=2, ensure_ascii=False)
+
 
 # ===================== 核心下载器类 =====================
 class BilibiliDownloader:
@@ -260,16 +283,65 @@ class BilibiliDownloader:
             self.logger.error(f"FFmpeg异常: {str(e)}")
             return False
 
+    # def download_video(self, bvid: str, cid: int, quality: int, dest_dir: Optional[Path] = None, suffix: str = "") -> bool:
+    #     """
+    #     完整的下载流程
+    #     参数:
+    #       bvid: 视频 bvid
+    #       cid: 分P对应的 cid
+    #       quality: 清晰度码
+    #       dest_dir: 视频保存目录，若为 None 则保存在配置中的 save_path 下
+    #       suffix: 输出文件名后缀（例如"-hdr"）
+    #     """
+    #     try:
+    #         if (bvid, cid, quality) in self.downloaded:
+    #             self.logger.info(f"跳过已下载内容: {bvid}-{cid}")
+    #             return True
+
+    #         video_info = self.get_video_info(bvid)
+    #         if not video_info:
+    #             return False
+
+    #         title = re.sub(r'[\\/:*?"<>|]', "", video_info["title"]).strip()[:100]
+    #         page_info = next((p for p in video_info["pages"] if p["cid"] == cid), None)
+    #         if not page_info:
+    #             self.logger.error(f"未找到分P信息: {bvid}-{cid}")
+    #             return False
+
+    #         owner = video_info.get("owner", {})
+    #         up_name = owner.get("name", "unknown")
+    #         up_name = re.sub(r'[\\/:*?"<>|]', "", up_name).strip()
+
+    #         output_name = f"{title}_{re.sub(r'[\\/:*?\"<>|]', '', page_info['part']).strip()}-{up_name}{suffix}.mp4"
+    #         if dest_dir is None:
+    #             dest_dir = self.config.save_path
+    #         dest_dir.mkdir(parents=True, exist_ok=True)
+    #         output_path = dest_dir / output_name
+
+    #         video_url, audio_url = self._get_media_urls(bvid, cid, quality)
+    #         if not video_url or not audio_url:
+    #             return False
+
+    #         temp_video = self.config.temp_dir / f"{bvid}_{cid}_video.m4s"
+    #         temp_audio = self.config.temp_dir / f"{bvid}_{cid}_audio.m4s"
+
+    #         success = (
+    #             self._download_media(video_url, temp_video) and
+    #             self._download_media(audio_url, temp_audio) and
+    #             self._merge_files(temp_video, temp_audio, output_path)
+    #         )
+
+    #         if success:
+    #             self._save_download_entry(bvid, cid, quality, title, up_name)
+    #             self.downloaded.add((bvid, cid, quality))
+    #         temp_video.unlink(missing_ok=True)
+    #         temp_audio.unlink(missing_ok=True)
+    #         return success
+    #     except Exception as e:
+    #         self.logger.error(f"下载流程异常: {str(e)}")
+    #         return False
+
     def download_video(self, bvid: str, cid: int, quality: int, dest_dir: Optional[Path] = None, suffix: str = "") -> bool:
-        """
-        完整的下载流程
-        参数:
-          bvid: 视频 bvid
-          cid: 分P对应的 cid
-          quality: 清晰度码
-          dest_dir: 视频保存目录，若为 None 则保存在配置中的 save_path 下
-          suffix: 输出文件名后缀（例如"-hdr"）
-        """
         try:
             if (bvid, cid, quality) in self.downloaded:
                 self.logger.info(f"跳过已下载内容: {bvid}-{cid}")
@@ -279,21 +351,29 @@ class BilibiliDownloader:
             if not video_info:
                 return False
 
-            title = re.sub(r'[\\/:*?"<>|]', "", video_info["title"]).strip()[:100]
             page_info = next((p for p in video_info["pages"] if p["cid"] == cid), None)
             if not page_info:
                 self.logger.error(f"未找到分P信息: {bvid}-{cid}")
                 return False
 
+            # 生成优化后的文件名
             owner = video_info.get("owner", {})
-            up_name = owner.get("name", "unknown")
-            up_name = re.sub(r'[\\/:*?"<>|]', "", up_name).strip()
+            up_name = owner.get("name", "unknown").strip()
+            base_filename = self._generate_filename(video_info, page_info, up_name, suffix)
+            output_name = f"{base_filename}.mp4"
 
-            output_name = f"{title}_{re.sub(r'[\\/:*?\"<>|]', '', page_info['part']).strip()}-{up_name}{suffix}.mp4"
+            # 处理保存路径和文件名冲突
             if dest_dir is None:
                 dest_dir = self.config.save_path
             dest_dir.mkdir(parents=True, exist_ok=True)
             output_path = dest_dir / output_name
+
+            # 处理文件名冲突
+            counter = 1
+            while output_path.exists():
+                output_name = f"{base_filename}_{counter}.mp4"
+                output_path = dest_dir / output_name
+                counter += 1
 
             video_url, audio_url = self._get_media_urls(bvid, cid, quality)
             if not video_url or not audio_url:
@@ -309,8 +389,9 @@ class BilibiliDownloader:
             )
 
             if success:
-                self._save_download_entry(bvid, cid, quality, title, up_name)
+                self._save_download_entry(bvid, cid, quality, base_filename, up_name)
                 self.downloaded.add((bvid, cid, quality))
+
             temp_video.unlink(missing_ok=True)
             temp_audio.unlink(missing_ok=True)
             return success
@@ -359,6 +440,50 @@ class BilibiliDownloader:
         except Exception as e:
             self.logger.error(f"媒体地址获取失败: {str(e)}")
             return None, None
+
+    def _generate_filename(self, video_info: Dict, page_info: Dict, up_name: str, suffix: str) -> str:
+        """
+        生成优化后的文件名
+        参数:
+            video_info: 视频信息字典
+            page_info: 分P信息字典
+            up_name: UP主名称
+            suffix: 特殊后缀（如hdr）
+        返回:
+            优化后的文件名（不含扩展名）
+        """
+        # 清理基础标题
+        raw_title = video_info["title"]
+        base_title = re.sub(
+            r'[\\/:*?"<>|【】()\[\]《》\s\U00010000-\U0010ffff]',  # 过滤特殊符号和表情
+            " ", 
+            raw_title
+        ).strip()
+        base_title = re.sub(r'\s+', ' ', base_title)[:self.config.max_title_length]
+
+        # 处理分P信息
+        page_num = page_info.get("page", 1)
+        total_pages = len(video_info.get("pages", []))
+        page_part = re.sub(r'[\\/:*?"<>|]', "", page_info['part']).strip()
+        
+        # 智能分P后缀处理
+        page_suffix = ""
+        if total_pages > 1:
+            if page_part.lower() in raw_title.lower():  # 分P名已包含在标题中
+                page_suffix = f"_P{page_num}"
+            else:
+                page_suffix = f"_{page_part[:20]}"  # 保留有区分度的部分
+
+        # 处理UP主名称
+        up_display = ""
+        if up_name != "unknown":
+            cleaned_up = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', up_name)  # 去除非中英文字符
+            up_display = f"-{cleaned_up[:self.config.upname_max_length]}"
+
+        # 组合各部分
+        filename = f"{base_title}{page_suffix}{up_display}{suffix}"
+        filename = re.sub(r'_{2,}', '_', filename)  # 清理连续下划线
+        return filename[:self.config.max_filename_length]
 
 # ===================== 用户交互类 =====================
 class InteractiveManager:
@@ -412,12 +537,24 @@ def main():
         print("错误：配置文件格式不正确")
         return
 
+    # config = Config(
+    #     cookies=config_data.get("cookies", ""),
+    #     save_path=Path(config_data.get("save_path", "./downloads")),
+    #     ffmpeg_path=config_data.get("ffmpeg_path", "ffmpeg"),
+    #     request_interval=config_data.get("request_interval", 1.5),
+    #     max_retries=config_data.get("max_retries", 3)
+    # )
+
     config = Config(
         cookies=config_data.get("cookies", ""),
         save_path=Path(config_data.get("save_path", "./downloads")),
         ffmpeg_path=config_data.get("ffmpeg_path", "ffmpeg"),
         request_interval=config_data.get("request_interval", 1.5),
-        max_retries=config_data.get("max_retries", 3)
+        max_retries=config_data.get("max_retries", 3),
+        # 新增配置项
+        max_title_length=config_data.get("max_title_length", 80),
+        max_filename_length=config_data.get("max_filename_length", 240),
+        upname_max_length=config_data.get("upname_max_length", 10)
     )
 
     downloader = BilibiliDownloader(config)

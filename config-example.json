@@ -3,5 +3,8 @@
     "save_path": "./bili_videos",
     "ffmpeg_path": "ffmpeg",
     "request_interval": 1.5,
-    "max_retries": 3
+    "max_retries": 3,
+    "max_title_length": 100,
+    "max_filename_length": 255,
+    "upname_max_length": 15
   }
